@@ -15,6 +15,7 @@
     <Compile Remove="Tests\**\*.cs" />
     <Resource Include="Chinese.ico" />
     <EmbeddedResource Include="data\现代汉语常用字表.txt" LogicalName="ChineseBuddy.CommonCharacters.txt" />
+    <EmbeddedResource Include="data\语文教材文本\**\*.md" LogicalName="ChineseBuddy.Textbooks.%(RecursiveDir)%(Filename)%(Extension)" />
     <PackageReference Include="PdfSharp" Version="6.2.4" />
     <PackageReference Include="PDFtoImage" Version="5.4.0" />
     <PackageReference Include="OpenCvSharp4.Windows" Version="4.13.0.20261107" />

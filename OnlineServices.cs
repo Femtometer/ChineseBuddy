@@ -195,15 +195,16 @@ public sealed class DictionaryService
         return changed;
     }
 
-    public static List<string> ParseWords(string json, string character, IReadOnlySet<string>? blacklist = null)
+    public static List<string> ParseWords(string json, string character, IReadOnlySet<string>? blacklist = null, Func<string, bool>? textbookContains = null)
     {
         if (!TextRules.IsSingleHan(character)) throw new ArgumentException("请输入单个汉字。", nameof(character));
         blacklist ??= WordBlacklist.Load();
+        textbookContains ??= TextbookCorpus.Contains;
         using var document = JsonDocument.Parse(json);
         var entries = document.RootElement.GetProperty("data").GetProperty("sections").GetProperty("entries");
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var results = new List<string>();
-        int candidates = 0;
+        var fallback = new List<string>();
         foreach (var entry in entries.EnumerateArray())
         {
             if (!entry.TryGetProperty("domain", out var domain) || domain.GetString() != "word" ||
@@ -211,14 +212,15 @@ public sealed class DictionaryService
             string word = title.GetString()?.Trim() ?? "";
             var runes = word.EnumerateRunes().ToArray();
             if (runes.Length is < 2 or > 12 || !word.Contains(character) || !runes.All(TextRules.IsHan) || !seen.Add(word)) continue;
-            candidates++;
             string pinyin = entry.TryGetProperty("pinyin", out var reading) && reading.ValueKind == JsonValueKind.String
                 ? Regex.Replace(reading.GetString()?.Trim() ?? "", @"\s+", " ") : "";
-            if (runes.Length == 2 && runes[0] != runes[1] && !blacklist.Contains(word.Normalize(NormalizationForm.FormKC)) && !string.IsNullOrWhiteSpace(pinyin) && CommonCharacters.ContainsAll(runes))
-                results.Add($"{word}({pinyin})");
-            if (results.Count == 3 || candidates == 20) break;
+            if (runes.Length != 2 || runes[0] == runes[1] || blacklist.Contains(word.Normalize(NormalizationForm.FormKC)) || string.IsNullOrWhiteSpace(pinyin) || !CommonCharacters.ContainsAll(runes)) continue;
+            string formatted = $"{word}({pinyin})";
+            if (fallback.Count < 3) fallback.Add(formatted);
+            if (textbookContains(word)) results.Add(formatted);
+            if (results.Count == 3) break;
         }
-        return results;
+        return results.Count > 0 ? results : fallback;
     }
 
     public Task<(string Pinyin, List<string> Words)> LookupAsync(string character, CancellationToken ct) => LookupAsync(character, ct, true, true);

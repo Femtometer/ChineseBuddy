@@ -210,7 +210,7 @@ public partial class MainWindow : Window
             StatusText.Text = $"正在批量查询拼音和词语：0/{characters.Length}…";
             await foreach (var result in BatchDictionaryService.RunAsync(characters,
                 (character, ct) => dictionary.LookupAsync(character, ct, planByCharacter[character].NeedsPinyin, planByCharacter[character].NeedsWords),
-                maxConcurrency: 4, cancellation,
+                maxConcurrency: BatchDictionaryService.DefaultMaxConcurrency, cancellation,
                 (character, pinyin, words) => (planByCharacter[character].NeedsPinyin && string.IsNullOrWhiteSpace(pinyin)) || (planByCharacter[character].NeedsWords && words.Count == 0)))
             {
                 string character = result.Character;
