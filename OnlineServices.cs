@@ -125,18 +125,17 @@ public sealed class DictionaryService
     public static string GetPinyinUrl(string character)
     {
         if (!TextRules.IsSingleHan(character)) throw new ArgumentException("请输入单个汉字。", nameof(character));
-        int codePoint = character.EnumerateRunes().Single().Value;
-        return $"http://zidian.dongrv.com/zi/{codePoint:x}/";
+        return "https://zdic.net/hans/" + Uri.EscapeDataString(character);
     }
 
     public static string ParsePinyin(string html, string character)
     {
         var doc = new HtmlDocument();
         doc.LoadHtml(html);
-        var title = doc.DocumentNode.SelectSingleNode("//div[contains(concat(' ',normalize-space(@class),' '),' zd-title ')]");
-        if (title == null || HtmlEntity.DeEntitize(title.InnerText).Trim() != character) return "";
-        var value = doc.DocumentNode.SelectSingleNode("//div[contains(concat(' ',normalize-space(@class),' '),' zd-detail ')]/span[contains(concat(' ',normalize-space(@class),' '),' attr_name ') and normalize-space(.)='拼音']/following-sibling::span[1][contains(concat(' ',normalize-space(@class),' '),' mr ')]");
-        return value == null ? "" : Regex.Replace(HtmlEntity.DeEntitize(value.InnerText).Trim(), @"\s+", " ");
+        var title = doc.DocumentNode.SelectSingleNode("//div[contains(concat(' ',normalize-space(@class),' '),' char-meta ')]");
+        if (title == null || HtmlEntity.DeEntitize(title.GetAttributeValue("content", "")) != character) return "";
+        var values = title.SelectNodes(".//span[contains(concat(' ',normalize-space(@class),' '),' meta-pinyin ')]");
+        return values == null ? "" : string.Join(" ", values.Select(v => Regex.Replace(HtmlEntity.DeEntitize(v.InnerText).Trim(), @"\s+", " ")).Where(v => v.Length > 0));
     }
 
     public static bool FillMissing(CharacterRecord item, string pinyin, IEnumerable<string> words)
@@ -195,30 +194,28 @@ public sealed class DictionaryService
         return changed;
     }
 
-    public static List<string> ParseWords(string json, string character, IReadOnlySet<string>? blacklist = null, Func<string, bool>? textbookContains = null)
+    public static List<string> ParseWords(string html, string character, IReadOnlySet<string>? blacklist = null, Func<string, bool>? textbookContains = null)
     {
         if (!TextRules.IsSingleHan(character)) throw new ArgumentException("请输入单个汉字。", nameof(character));
         blacklist ??= WordBlacklist.Load();
         textbookContains ??= TextbookCorpus.Contains;
-        using var document = JsonDocument.Parse(json);
-        var entries = document.RootElement.GetProperty("data").GetProperty("sections").GetProperty("entries");
+        var doc = new HtmlDocument();
+        doc.LoadHtml(html);
+        var title = doc.DocumentNode.SelectSingleNode("//div[contains(concat(' ',normalize-space(@class),' '),' char-meta ')]");
+        if (title == null || HtmlEntity.DeEntitize(title.GetAttributeValue("content", "")) != character) return [];
+        var entries = doc.DocumentNode.SelectNodes("//div[contains(concat(' ',normalize-space(@class),' '),' xxjs-cizu ')]//a[contains(concat(' ',normalize-space(@class),' '),' xxjs-cizu__word ')]");
+        if (entries == null) return [];
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var results = new List<string>();
         var fallback = new List<string>();
-        foreach (var entry in entries.EnumerateArray())
+        foreach (var entry in entries)
         {
-            if (!entry.TryGetProperty("domain", out var domain) || domain.GetString() != "word" ||
-                !entry.TryGetProperty("title_sc", out var title) || title.ValueKind != JsonValueKind.String) continue;
-            string word = title.GetString()?.Trim() ?? "";
+            string word = HtmlEntity.DeEntitize(entry.InnerText).Trim();
             var runes = word.EnumerateRunes().ToArray();
-            if (runes.Length is < 2 or > 12 || !word.Contains(character) || !runes.All(TextRules.IsHan) || !seen.Add(word)) continue;
-            string pinyin = entry.TryGetProperty("pinyin", out var reading) && reading.ValueKind == JsonValueKind.String
-                ? Regex.Replace(reading.GetString()?.Trim() ?? "", @"\s+", " ") : "";
-            if (runes.Length != 2 || runes[0] == runes[1] || blacklist.Contains(word.Normalize(NormalizationForm.FormKC)) || string.IsNullOrWhiteSpace(pinyin) || !CommonCharacters.ContainsAll(runes)) continue;
-            string formatted = $"{word}({pinyin})";
-            if (fallback.Count < 3) fallback.Add(formatted);
-            if (textbookContains(word)) results.Add(formatted);
-            if (results.Count == 3) break;
+            if (runes.Length is < 2 or > 4 || !word.Contains(character) || !runes.All(TextRules.IsHan) || !seen.Add(word)) continue;
+            if ((runes.Length == 2 && runes[0] == runes[1]) || blacklist.Contains(word.Normalize(NormalizationForm.FormKC)) || !CommonCharacters.ContainsAll(runes)) continue;
+            if (textbookContains(word)) results.Add(word);
+            else if (runes.Length == 2) fallback.Add(word);
         }
         return results.Count > 0 ? results : fallback;
     }
@@ -229,36 +226,40 @@ public sealed class DictionaryService
     {
         if (!TextRules.IsSingleHan(character)) throw new ArgumentException("请输入单个汉字。", nameof(character));
         ct.ThrowIfCancellationRequested();
-        var pinyinTask = needsPinyin ? LookupPinyinAsync(character, ct) : Task.FromResult("");
-        var wordsTask = needsWords ? LookupWordsAsync(character, ct) : Task.FromResult(new List<string>());
-        await Task.WhenAll(pinyinTask, wordsTask).ConfigureAwait(false);
-        return (await pinyinTask.ConfigureAwait(false), await wordsTask.ConfigureAwait(false));
-    }
-
-    private async Task<string> LookupPinyinAsync(string character, CancellationToken ct)
-    {
+        if (!needsPinyin && !needsWords) return ("", []);
         try
         {
             var html = await http.GetStringAsync(GetPinyinUrl(character), ct).ConfigureAwait(false);
-            return ParsePinyin(html, character);
+            string pinyin = needsPinyin ? ParsePinyin(html, character) : "";
+            var words = new List<string>();
+            if (needsWords)
+            {
+                foreach (var word in ParseWords(html, character).Take(3))
+                {
+                    try
+                    {
+                        var wordHtml = await http.GetStringAsync("https://zdic.net/hans/" + Uri.EscapeDataString(word), ct).ConfigureAwait(false);
+                        string reading = ParseWordPinyin(wordHtml, word);
+                        if (!string.IsNullOrWhiteSpace(reading)) words.Add($"{word}({reading})");
+                    }
+                    catch (Exception e) when (e is HttpRequestException or TaskCanceledException) { if (ct.IsCancellationRequested) throw; }
+                    if (words.Count == 3) break;
+                }
+            }
+            return (pinyin, words);
         }
         catch (Exception e) when (e is HttpRequestException or TaskCanceledException) { if (ct.IsCancellationRequested) throw; }
-        return "";
+        return ("", []);
     }
 
-    private async Task<List<string>> LookupWordsAsync(string character, CancellationToken ct)
+    public static string ParseWordPinyin(string html, string word)
     {
-        try
-        {
-            var url = "https://www.zdic.net/api/v3/search/query?q=" + Uri.EscapeDataString(character) + "&mode=word&page=1";
-            var json = await http.GetStringAsync(url, ct).ConfigureAwait(false);
-            return ParseWords(json, character);
-        }
-        catch (Exception e) when (e is HttpRequestException or TaskCanceledException or JsonException or KeyNotFoundException or InvalidOperationException)
-        {
-            if (ct.IsCancellationRequested) throw;
-            return [];
-        }
+        var doc = new HtmlDocument();
+        doc.LoadHtml(html);
+        var title = doc.DocumentNode.SelectSingleNode("//div[contains(concat(' ',normalize-space(@class),' '),' word-headword-row ')]/span[contains(concat(' ',normalize-space(@class),' '),' dict-section__char ')]");
+        if (title == null || HtmlEntity.DeEntitize(title.InnerText).Trim() != word) return "";
+        var reading = doc.DocumentNode.SelectSingleNode("//div[contains(concat(' ',normalize-space(@class),' '),' word-pronun-row ')]//span[contains(concat(' ',normalize-space(@class),' '),' meta-pinyin ')]");
+        return reading == null ? "" : Regex.Replace(HtmlEntity.DeEntitize(reading.InnerText).Trim(), @"\s+", " ");
     }
 }
 
